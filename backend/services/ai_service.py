@@ -1,8 +1,10 @@
 import json
 import logging
 import os
+import time
 from typing import Any, Dict, List, Optional
 
+import httpx2
 from google import genai
 from google.genai import errors, types
 
@@ -11,6 +13,11 @@ from config import Config
 logger = logging.getLogger(__name__)
 
 GEMINI_MODEL = "gemini-3.8-flash"
+GEMINI_REQUEST_TIMEOUT_MS = 12_000
+GEMINI_MAX_ATTEMPTS = 3
+GEMINI_RETRYABLE_STATUS_CODES = frozenset({429, 503, 504})
+GEMINI_RETRY_INITIAL_DELAY_SECONDS = 0.5
+GEMINI_RETRY_MAX_DELAY_SECONDS = 2.0
 
 
 class AIService:
@@ -50,29 +57,112 @@ class AIService:
         try:
             with genai.Client(
                 api_key=self.gemini_key,
-                http_options=types.HttpOptions(timeout=12_000),
+                http_options=types.HttpOptions(timeout=GEMINI_REQUEST_TIMEOUT_MS),
             ) as client:
-                response = client.models.generate_content(
-                    model=GEMINI_MODEL,
-                    contents=request_text,
-                    config=types.GenerateContentConfig(
-                        temperature=0.2,
-                        response_mime_type="application/json",
-                    ),
-                )
-            parsed = json.loads(response.text)
-            validated = self._validate_response(parsed, text)
-            if validated is None:
-                logger.warning("Gemini response did not match the required analysis schema")
-                return None
-            validated["engine_used"] = "AI_GEMINI"
-            return validated
-        except (errors.APIError, ValueError, KeyError, IndexError, TypeError) as error:
+                for attempt in range(1, GEMINI_MAX_ATTEMPTS + 1):
+                    try:
+                        response = client.models.generate_content(
+                            model=GEMINI_MODEL,
+                            contents=request_text,
+                            config=types.GenerateContentConfig(
+                                temperature=0.2,
+                                response_mime_type="application/json",
+                            ),
+                        )
+                        parsed = json.loads(response.text)
+                        validated = self._validate_response(parsed, text)
+                        if validated is None:
+                            logger.warning(
+                                "Gemini response did not match the required analysis schema"
+                            )
+                            return None
+                        validated["engine_used"] = "AI_GEMINI"
+                        return validated
+                    except errors.APIError as error:
+                        status_code = error.code
+                        if (
+                            status_code in GEMINI_RETRYABLE_STATUS_CODES
+                            and attempt < GEMINI_MAX_ATTEMPTS
+                        ):
+                            delay = min(
+                                GEMINI_RETRY_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1)),
+                                GEMINI_RETRY_MAX_DELAY_SECONDS,
+                            )
+                            logger.warning(
+                                "Gemini request failed: HTTP %s; %s; "
+                                "retrying attempt %s/%s after %.1f seconds",
+                                status_code,
+                                self._safe_http_diagnostic(status_code),
+                                attempt + 1,
+                                GEMINI_MAX_ATTEMPTS,
+                                delay,
+                            )
+                            time.sleep(delay)
+                            continue
+
+                        logger.warning(
+                            "Gemini analysis failed: HTTP %s; %s; using rule-based results",
+                            status_code,
+                            self._safe_http_diagnostic(status_code),
+                        )
+                        return None
+                    except (httpx2.TimeoutException, httpx2.ConnectError):
+                        if attempt < GEMINI_MAX_ATTEMPTS:
+                            delay = min(
+                                GEMINI_RETRY_INITIAL_DELAY_SECONDS * (2 ** (attempt - 1)),
+                                GEMINI_RETRY_MAX_DELAY_SECONDS,
+                            )
+                            logger.warning(
+                                "Gemini request failed: no HTTP status; request timed out "
+                                "or connection failed; retrying attempt %s/%s after %.1f seconds",
+                                attempt + 1,
+                                GEMINI_MAX_ATTEMPTS,
+                                delay,
+                            )
+                            time.sleep(delay)
+                            continue
+
+                        logger.warning(
+                            "Gemini analysis failed: no HTTP status; request timed out "
+                            "or connection failed; using rule-based results"
+                        )
+                        return None
+                    except (ValueError, KeyError, IndexError, TypeError) as error:
+                        logger.warning(
+                            "Gemini analysis failed (%s); using rule-based results",
+                            type(error).__name__,
+                        )
+                        return None
+        except errors.APIError as error:
             logger.warning(
-                "Gemini analysis failed (%s); using rule-based results",
+                "Gemini client setup failed: HTTP %s; %s; using rule-based results",
+                error.code,
+                self._safe_http_diagnostic(error.code),
+            )
+            return None
+        except (
+            httpx2.TimeoutException,
+            httpx2.ConnectError,
+            ValueError,
+            KeyError,
+            IndexError,
+            TypeError,
+        ) as error:
+            logger.warning(
+                "Gemini client setup failed (%s); using rule-based results",
                 type(error).__name__,
             )
             return None
+        return None
+
+    @staticmethod
+    def _safe_http_diagnostic(status_code: int) -> str:
+        diagnostics = {
+            429: "Gemini rate limit",
+            503: "Gemini temporarily unavailable",
+            504: "Gemini gateway timeout",
+        }
+        return diagnostics.get(status_code, "permanent Gemini API error; not retried")
 
     @staticmethod
     def _validate_response(result: Any, source_text: str) -> Optional[Dict[str, Any]]:

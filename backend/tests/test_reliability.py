@@ -1,9 +1,13 @@
+import json
 import sys
 import os
 import tempfile
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
+
+import httpx2
+from google.genai import errors
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 _test_database_dir = tempfile.TemporaryDirectory(prefix="brandguard-test-bootstrap-")
@@ -70,24 +74,147 @@ class BackendReliabilityTests(unittest.TestCase):
                 self.assertEqual(response.status_code, 400, response.get_json())
                 self.assertFalse(response.get_json()["success"])
 
-    def test_ai_timeout_fails_over_without_raising_or_replacing_rule_results(self):
+    def test_ai_timeout_retries_then_returns_none_for_rule_fallback(self):
         service = AIService()
-        service.gemini_key = "unit-test-key"
+        service.gemini_key = "test-key-never-log"
         client = Mock()
-        client.models.generate_content.side_effect = ValueError("provider timed out")
+        client.models.generate_content.side_effect = httpx2.TimeoutException(
+            "sensitive audit text"
+        )
         with patch("services.ai_service.genai.Client") as client_factory:
             client_factory.return_value.__enter__.return_value = client
-            result = service.analyze_with_ai(
-                "Sample content",
-                {"name": "Reliability Brand"},
-                [],
-                [],
-                [],
-                {},
-                "Ad Copy",
-                "Digital Ads",
-            )
+            with patch("services.ai_service.time.sleep") as sleep:
+                with self.assertLogs("services.ai_service", level="WARNING") as logs:
+                    result = service.analyze_with_ai(
+                        "Sample content",
+                        {"name": "Reliability Brand"},
+                        [],
+                        [],
+                        [],
+                        {},
+                        "Ad Copy",
+                        "Digital Ads",
+                    )
         self.assertIsNone(result)
+        self.assertEqual(client.models.generate_content.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.0])
+        self.assertNotIn("sensitive audit text", "\n".join(logs.output))
+        self.assertNotIn("test-key-never-log", "\n".join(logs.output))
+
+    def test_ai_retries_transient_http_error_and_recovers(self):
+        ai_response = {
+            "score": 90,
+            "sub_scores": {
+                "terminology": 90,
+                "facts": 90,
+                "tone": 90,
+                "claims": 90,
+                "accessibility": 90,
+            },
+            "issues": [],
+            "corrected_text": "Sample content",
+            "summary": "No policy issues detected.",
+        }
+        for status_code in (504, 503, 429):
+            with self.subTest(status_code=status_code):
+                service = AIService()
+                service.gemini_key = "test-key-never-log"
+                client = Mock()
+                client.models.generate_content.side_effect = [
+                    errors.ServerError(
+                        status_code,
+                        {"message": "sensitive audit text"},
+                    ),
+                    Mock(text=json.dumps(ai_response)),
+                ]
+                with patch("services.ai_service.genai.Client") as client_factory:
+                    client_factory.return_value.__enter__.return_value = client
+                    with patch("services.ai_service.time.sleep") as sleep:
+                        with self.assertLogs(
+                            "services.ai_service", level="WARNING"
+                        ) as logs:
+                            result = service.analyze_with_ai(
+                                "Sample content",
+                                {"name": "Reliability Brand"},
+                                [],
+                                [],
+                                [],
+                                {},
+                                "Ad Copy",
+                                "Digital Ads",
+                            )
+
+                self.assertEqual(result["engine_used"], "AI_GEMINI")
+                self.assertEqual(client.models.generate_content.call_count, 2)
+                sleep.assert_called_once_with(0.5)
+                self.assertTrue(any(
+                    f"HTTP {status_code}" in message for message in logs.output
+                ))
+                self.assertNotIn("sensitive audit text", "\n".join(logs.output))
+                self.assertNotIn("test-key-never-log", "\n".join(logs.output))
+
+    def test_analysis_uses_rule_fallback_after_gemini_retries_are_exhausted(self):
+        brand_id = self.create_brand()
+        analyzer.ai_service.gemini_key = "test-key-never-log"
+        client = Mock()
+        client.models.generate_content.side_effect = [
+            errors.ServerError(504, {"message": "sensitive audit text"})
+            for _ in range(3)
+        ]
+
+        with patch("services.ai_service.genai.Client") as client_factory:
+            client_factory.return_value.__enter__.return_value = client
+            with patch("services.ai_service.time.sleep") as sleep:
+                with self.assertLogs("services.ai_service", level="WARNING") as logs:
+                    response = self.client.post("/api/analysis/quick-check", json={
+                        "brand_id": brand_id,
+                        "text": "Content for the transient-failure check.",
+                    })
+
+        self.assertEqual(response.status_code, 200, response.get_json())
+        self.assertEqual(
+            response.get_json()["result"]["engine_used"],
+            "RULE_BASED_FALLBACK",
+        )
+        self.assertEqual(client.models.generate_content.call_count, 3)
+        self.assertEqual([call.args[0] for call in sleep.call_args_list], [0.5, 1.0])
+        messages = "\n".join(logs.output)
+        self.assertIn("HTTP 504", messages)
+        self.assertIn("gateway timeout", messages.lower())
+        self.assertNotIn("sensitive audit text", messages)
+        self.assertNotIn("test-key-never-log", messages)
+        http_options = client_factory.call_args.kwargs["http_options"]
+        self.assertEqual(http_options.timeout, 12_000)
+
+    def test_ai_does_not_retry_permanent_api_errors(self):
+        service = AIService()
+        service.gemini_key = "test-key-never-log"
+        client = Mock()
+        client.models.generate_content.side_effect = errors.ClientError(
+            403, {"message": "sensitive audit text"}
+        )
+        with patch("services.ai_service.genai.Client") as client_factory:
+            client_factory.return_value.__enter__.return_value = client
+            with patch("services.ai_service.time.sleep") as sleep:
+                with self.assertLogs("services.ai_service", level="WARNING") as logs:
+                    result = service.analyze_with_ai(
+                        "Sample content",
+                        {"name": "Reliability Brand"},
+                        [],
+                        [],
+                        [],
+                        {},
+                        "Ad Copy",
+                        "Digital Ads",
+                    )
+
+        self.assertIsNone(result)
+        client.models.generate_content.assert_called_once()
+        sleep.assert_not_called()
+        self.assertTrue(any("HTTP 403" in message for message in logs.output))
+        self.assertTrue(any("not retried" in message.lower() for message in logs.output))
+        self.assertNotIn("sensitive audit text", "\n".join(logs.output))
+        self.assertNotIn("test-key-never-log", "\n".join(logs.output))
 
     def test_audit_and_draft_preserve_source_whitespace_and_offsets(self):
         brand_id = self.create_brand()
