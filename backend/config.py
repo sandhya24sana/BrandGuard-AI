@@ -11,6 +11,10 @@ load_dotenv(BASE_DIR / ".env")
 class Config:
     SECRET_KEY = os.environ.get("SECRET_KEY") or secrets.token_hex(32)
 
+    # PostgreSQL connection URL (Render)
+    DATABASE_URL = os.environ.get("DATABASE_URL", "").strip()
+
+    # SQLite fallback for local development
     DATABASE_PATH = os.environ.get(
         "DATABASE_PATH",
         str(BASE_DIR / "brandguard.db")
@@ -21,7 +25,7 @@ class Config:
         str(BASE_DIR / "uploads")
     )
 
-    MAX_CONTENT_LENGTH = 16 * 1024 * 1024  # 16 MB max upload
+    MAX_CONTENT_LENGTH = 16 * 1024 * 1024
 
     GEMINI_API_KEY = os.environ.get("GEMINI_API_KEY", "")
 
